@@ -4,7 +4,7 @@ from .nativecontract import NativeContract
 from .decorator import register
 from neo3 import storage, contracts, vm, settings
 from neo3.core import types, msgrouter, cryptography, serialization, to_script_hash, Size as s, IInteroperable
-from typing import Tuple, List, Dict, Sequence, cast
+from typing import Tuple, List, Dict, Sequence, cast, Optional
 
 
 class FungibleTokenStorageState(IInteroperable, serialization.ISerializable):
@@ -524,6 +524,7 @@ class NeoToken(FungibleToken):
             state = storage_item.get(_CandidateState)
             state.registered = True
         self._candidates_dirty = True
+        msgrouter.register_candidate(public_key, engine.snapshot.persisting_block)
         return True
 
     @register("unregisterCandidate", contracts.CallFlags.STATES, cpu_price=1 << 16)
@@ -555,13 +556,14 @@ class NeoToken(FungibleToken):
                 engine.snapshot.storages.delete(storage_key)
 
         self._candidates_dirty = True
+        msgrouter.unregister_candidate(public_key, engine.snapshot.persisting_block)
         return True
 
     @register("vote", contracts.CallFlags.STATES, cpu_price=1 << 16)
     def vote(self,
              engine: contracts.ApplicationEngine,
              account: types.UInt160,
-             vote_to: cryptography.ECPoint) -> bool:
+             vote_to: Optional[cryptography.ECPoint]) -> bool:
         """
         Vote on a consensus candidate
         Args:
@@ -581,37 +583,53 @@ class NeoToken(FungibleToken):
             return False
         account_state = storage_item.get(self._state)
 
-        storage_key_candidate = self.key_candidate + vote_to
-        storage_item_candidate = engine.snapshot.storages.try_get(storage_key_candidate, read_only=False)
-        if storage_item_candidate is None:
-            return False
+        # verify vote target candidate exists
+        candidate_state = None
+        if vote_to is not None:
+            storage_key_candidate = self.key_candidate + vote_to
+            storage_item_candidate = engine.snapshot.storages.try_get(storage_key_candidate, read_only=False)
+            if storage_item_candidate is None:
+                return False
 
-        candidate_state = storage_item_candidate.get(_CandidateState)
-        if not candidate_state.registered:
-            return False
+            candidate_state = storage_item_candidate.get(_CandidateState)
+            if not candidate_state.registered:
+                return False
 
-        if account_state.vote_to.is_zero():
+        # if we haven't voted before, or we're trying to remove our vote
+        if account_state.vote_to.is_zero() ^ (vote_to is None):
             si_voters_count = engine.snapshot.storages.get(self.key_voters_count, read_only=False)
-
             old_value = vm.BigInteger(si_voters_count.value)
-            new_value = old_value + account_state.balance
+            if account_state.vote_to.is_zero():
+                new_value = old_value + account_state.balance
+            else:
+                # removing vote
+                new_value = old_value - account_state.balance
             si_voters_count.value = new_value.to_array()
 
         self._distribute_gas(engine, account, account_state)
 
+        old_vote_account = None
+        # we're trying to change our vote to another candidate, remove votes from the old candidate
         if not account_state.vote_to.is_zero():
+            old_vote_account = account_state.vote_to
             sk_validator = self.key_candidate + account_state.vote_to
             si_validator = engine.snapshot.storages.get(sk_validator, read_only=False)
             validator_state = si_validator.get(_CandidateState)
             validator_state.votes -= account_state.balance
 
             if not validator_state.registered and validator_state.votes == 0:
+                reward_key = self.key_voter_reward_per_committee + account_state.vote_to.to_array()
+                for k, _ in engine.snapshot.storages.find(reward_key):
+                    engine.snapshot.storages.delete(k)
                 engine.snapshot.storages.delete(sk_validator)
 
-        account_state.vote_to = vote_to
-        candidate_state.votes += account_state.balance
+        account_state.vote_to = vote_to if vote_to else cryptography.ECPoint.deserialize_from_bytes(b'\x00')
+        # finally update voting count on the new candidate
+        if candidate_state is not None:
+            candidate_state.votes += account_state.balance
         self._candidates_dirty = True
 
+        msgrouter.vote(account, account_state.balance, vote_to, old_vote_account, engine.snapshot.persisting_block)
         return True
 
     @register("getCandidates", contracts.CallFlags.READ_STATES, cpu_price=1 << 22)
@@ -709,6 +727,7 @@ class NeoToken(FungibleToken):
         candidate_state.votes += amount
         self._candidates_dirty = True
         self._check_candidate(engine.snapshot, state.vote_to, candidate_state)
+        msgrouter.neo_balance_changing(account, state.vote_to, amount, engine.snapshot.persisting_block)
 
     def on_persist(self, engine: contracts.ApplicationEngine) -> None:
         super(NeoToken, self).on_persist(engine)
@@ -718,6 +737,7 @@ class NeoToken(FungibleToken):
             validators = self._compute_committee_members(engine.snapshot)
             if self._committee_state is None:
                 self._committee_state = _CommitteeState.from_snapshot(engine.snapshot)
+            msgrouter.new_committee(validators, engine.snapshot.persisting_block)
             self._committee_state._validators = validators
             self._committee_state.persist(engine.snapshot)
 
