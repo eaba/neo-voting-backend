@@ -38,7 +38,7 @@ chain = blockchain.Blockchain(implementations.LevelDB({'path': STORAGE_PATH}))
 
 async def sync_from_network():
     seedlist = settings.network.seedlist
-    if len(seedlist) == 0 or seedlist[1] is None:
+    if len(seedlist) == 0 or seedlist[0] is None:
         print("Must set 'VOTING_NETWORK' evironment variable to valid P2P network address")
         SystemExit(-1)
     node_mgr = convenience.NodeManager()
